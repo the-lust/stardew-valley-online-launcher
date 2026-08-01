@@ -1,14 +1,14 @@
 // ============================================================================
 //  game.exe — Stardew Valley Online private co-op launcher
 //  Single-file C++20, Win32 console app, ANSI truecolor UI.
-//  v0.1.0 — menu UI; "Launch Game" runs StardewModdingAPI.exe silently
-//  (SMAPI's own terminal window is hidden).
+//  v0.2.0 — hardened build: compile-time string encryption, dynamic API
+//  resolution. All tool strings are encrypted at rest and decrypted at
+//  runtime; the launcher's WinAPI calls are resolved via GetProcAddress.
 // ============================================================================
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <tlhelp32.h>
 #include <shellapi.h>
-#pragma comment(lib, "shell32.lib")
 
 #include <algorithm>
 #include <array>
@@ -23,6 +23,103 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+// ----------------------------------------------------------------------------
+// compile-time string encryption
+//   every string literal is XOR-ciphered at compile time with a per-call-site
+//   key stream; plaintext exists only on the stack/heap during runtime.
+// ----------------------------------------------------------------------------
+namespace obs {
+
+constexpr uint32_t mix(uint32_t x) {
+    x ^= x >> 16; x *= 0x7feb352dU; x ^= x >> 15; x *= 0x846ca68bU; x ^= x >> 16;
+    return x;
+}
+
+template <size_t N>
+struct Blob {
+    uint8_t data[N];
+    uint32_t seed;
+    constexpr Blob(const char (&s)[N], uint32_t sd) : data{}, seed(sd) {
+        for (size_t i = 0; i < N; ++i) {
+            uint32_t k = mix(sd + static_cast<uint32_t>(i * 2654435761U));
+            data[i] = static_cast<uint8_t>(static_cast<uint8_t>(s[i]) ^ static_cast<uint8_t>(k & 0xff));
+        }
+    }
+    std::string get() const {
+        std::string out(N - 1, '\0');
+        for (size_t i = 0; i + 1 < N; ++i) {
+            uint32_t k = mix(seed + static_cast<uint32_t>(i * 2654435761U));
+            out[i] = static_cast<char>(static_cast<uint8_t>(data[i]) ^ static_cast<uint8_t>(k & 0xff));
+        }
+        return out;
+    }
+};
+
+template <size_t N>
+struct BlobW {
+    uint8_t data[N * 2];
+    uint32_t seed;
+    constexpr BlobW(const wchar_t (&s)[N], uint32_t sd) : data{}, seed(sd) {
+        for (size_t i = 0; i < N; ++i) {
+            const wchar_t c = s[i];
+            uint32_t k1 = mix(sd + static_cast<uint32_t>(i * 2654435761U));
+            uint32_t k2 = mix(sd + static_cast<uint32_t>(i * 2654435761U) + 0x85ebca6bU);
+            data[i * 2]     = static_cast<uint8_t>(static_cast<uint8_t>(c & 0xff)       ^ static_cast<uint8_t>(k1 & 0xff));
+            data[i * 2 + 1] = static_cast<uint8_t>(static_cast<uint8_t>((c >> 8) & 0xff) ^ static_cast<uint8_t>(k2 & 0xff));
+        }
+    }
+    std::wstring get() const {
+        std::wstring out(N - 1, L'\0');
+        for (size_t i = 0; i + 1 < N; ++i) {
+            uint32_t k1 = mix(seed + static_cast<uint32_t>(i * 2654435761U));
+            uint32_t k2 = mix(seed + static_cast<uint32_t>(i * 2654435761U) + 0x85ebca6bU);
+            wchar_t c = static_cast<wchar_t>(
+                static_cast<uint16_t>(
+                    (static_cast<uint16_t>(data[i * 2]) ^ static_cast<uint16_t>(k1 & 0xff)) |
+                    (static_cast<uint16_t>(static_cast<uint16_t>(data[i * 2 + 1]) ^ static_cast<uint16_t>(k2 & 0xff)) << 8)));
+            out[i] = c;
+        }
+        return out;
+    }
+};
+
+} // namespace obs
+
+#define S(s)  ([]() -> std::string { constexpr static auto b = obs::Blob(s, __COUNTER__ * 0x9e3779b1U + 0x5bd1e995U); return b.get(); }())
+#define SW(s) ([]() -> std::wstring { constexpr static auto b = obs::BlobW(s, __COUNTER__ * 0x9e3779b1U + 0x5bd1e995U); return b.get(); }())
+
+// ----------------------------------------------------------------------------
+// dynamic API resolution (import table stays minimal)
+// ----------------------------------------------------------------------------
+using FnShellExecuteExW              = BOOL(WINAPI*)(SHELLEXECUTEINFOW*);
+using FnCreateToolhelp32Snapshot     = HANDLE(WINAPI*)(DWORD, DWORD);
+using FnProcess32FirstW              = BOOL(WINAPI*)(HANDLE, LPPROCESSENTRY32W);
+using FnProcess32NextW               = BOOL(WINAPI*)(HANDLE, LPPROCESSENTRY32W);
+
+struct Api {
+    FnShellExecuteExW          shellExec = nullptr;
+    FnCreateToolhelp32Snapshot snap      = nullptr;
+    FnProcess32FirstW          procFirst = nullptr;
+    FnProcess32NextW           procNext  = nullptr;
+};
+static Api g_api;
+
+bool initApi() {
+    if (HMODULE sh = LoadLibraryW(SW(L"shell32.dll").c_str())) {
+        g_api.shellExec = reinterpret_cast<FnShellExecuteExW>(
+            GetProcAddress(sh, S("ShellExecuteExW").c_str()));
+    }
+    if (HMODULE k32 = GetModuleHandleW(SW(L"kernel32.dll").c_str())) {
+        g_api.snap      = reinterpret_cast<FnCreateToolhelp32Snapshot>(
+            GetProcAddress(k32, S("CreateToolhelp32Snapshot").c_str()));
+        g_api.procFirst = reinterpret_cast<FnProcess32FirstW>(
+            GetProcAddress(k32, S("Process32FirstW").c_str()));
+        g_api.procNext  = reinterpret_cast<FnProcess32NextW>(
+            GetProcAddress(k32, S("Process32NextW").c_str()));
+    }
+    return g_api.shellExec && g_api.snap && g_api.procFirst && g_api.procNext;
+}
 
 // ----------------------------------------------------------------------------
 // ANSI helpers
@@ -65,7 +162,7 @@ struct Console {
         SetConsoleMode(hOut, origMode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
         origCodePage = GetConsoleOutputCP();
         SetConsoleOutputCP(CP_UTF8);
-        SetConsoleTitleW(L"Multiplayer Private — Stardew Valley Online");
+        SetConsoleTitleW(SW(L"Multiplayer Private — Stardew Valley Online").c_str());
         std::cout << term::CLEAR << term::HOME << term::HIDE;
         return true;
     }
@@ -136,14 +233,14 @@ std::vector<std::string> gradient(int n) {
 }
 
 void printBanner(const Console& console) {
-    const std::string line1 = "STARDEW VALLEY";
-    const std::string line2 = "ONLINE";
+    const std::string line1 = S("STARDEW VALLEY");
+    const std::string line2 = S("ONLINE");
     const int w = console.size().X;
     const int glyphW = 7; // 6 + spacer
     const int need = static_cast<int>(line1.size()) * glyphW;
 
     if (w < need) { // fallback: plain text logo
-        std::cout << pal::gold << term::BOLD << "  * STARDEW VALLEY ONLINE *\n" << term::RESET;
+        std::cout << pal::gold << term::BOLD << S("  * STARDEW VALLEY ONLINE *\n") << term::RESET;
         return;
     }
     const auto cols = gradient(static_cast<int>(line1.size() + line2.size()));
@@ -182,7 +279,7 @@ void printBanner(const Console& console) {
         }
         std::cout << "\n";
     }
-    std::cout << pal::dim << "          ~ private multiplayer launcher ~\n" << term::RESET;
+    std::cout << pal::dim << S("          ~ private multiplayer launcher ~\n") << term::RESET;
 }
 
 void typewriter(const std::string& text, int msPerChar = 12) {
@@ -207,8 +304,8 @@ void spinner(int cycles, const std::string& label) {
 // ----------------------------------------------------------------------------
 std::optional<std::wstring> findGameDir() {
     std::wstring dir;
-    if (const wchar_t* env = _wgetenv(L"SDV_GAME_DIR"); env && *env) dir = env;
-    if (dir.empty()) dir = L"D:\\SDW\\Stardew Valley (413150)\\Stardew Valley";
+    if (const wchar_t* env = _wgetenv(SW(L"SDV_GAME_DIR").c_str()); env && *env) dir = env;
+    if (dir.empty()) dir = SW(L"D:\\SDW\\Stardew Valley (413150)\\Stardew Valley");
 
     wchar_t exePath[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exePath, MAX_PATH);
@@ -219,14 +316,14 @@ std::optional<std::wstring> findGameDir() {
     std::vector<std::wstring> candidates;
     candidates.push_back(exeDir); // game.exe placed next to the game folder
     candidates.push_back(dir);
-    candidates.push_back(exeDir + L"\\..\\..\\Stardew Valley (413150)\\Stardew Valley");
+    candidates.push_back(exeDir + SW(L"\\..\\..\\Stardew Valley (413150)\\Stardew Valley"));
 
     for (const auto& c : candidates) {
         if (c.empty()) continue;
         auto has = [&](const wchar_t* f) {
             return GetFileAttributesW((c + L"\\" + f).c_str()) != INVALID_FILE_ATTRIBUTES;
         };
-        if (has(L"Stardew Valley.exe") || has(L"StardewModdingAPI.exe"))
+        if (has(SW(L"Stardew Valley.exe").c_str()) || has(SW(L"StardewModdingAPI.exe").c_str()))
             return c;
     }
     return std::nullopt;
@@ -234,9 +331,13 @@ std::optional<std::wstring> findGameDir() {
 
 // Launches StardewModdingAPI.exe with its console window hidden.
 bool launchGameSilently(const std::wstring& gameDir, std::wstring& err) {
-    std::wstring api = gameDir + L"\\StardewModdingAPI.exe";
+    if (!g_api.shellExec) {
+        err = SW(L"initialization failed");
+        return false;
+    }
+    std::wstring api = gameDir + SW(L"\\StardewModdingAPI.exe");
     if (GetFileAttributesW(api.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        err = L"StardewModdingAPI.exe not found — apply the fix first";
+        err = SW(L"StardewModdingAPI.exe not found — apply the fix first");
         return false;
     }
     SHELLEXECUTEINFOW sei{};
@@ -245,10 +346,10 @@ bool launchGameSilently(const std::wstring& gameDir, std::wstring& err) {
     sei.lpFile = api.c_str();
     sei.lpDirectory = gameDir.c_str();
     sei.nShow = SW_HIDE;
-    if (!ShellExecuteExW(&sei)) {
+    if (!g_api.shellExec(&sei)) {
         wchar_t buf[512]{};
         FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM, nullptr, GetLastError(), 0, buf, 512, nullptr);
-        err = std::wstring(L"launch failed: ") + buf;
+        err = SW(L"launch failed: ") + buf;
         return false;
     }
     if (sei.hProcess) CloseHandle(sei.hProcess);
@@ -256,16 +357,17 @@ bool launchGameSilently(const std::wstring& gameDir, std::wstring& err) {
 }
 
 bool isGameRunning() {
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (!g_api.snap || !g_api.procFirst || !g_api.procNext) return false;
+    HANDLE snap = g_api.snap(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return false;
     PROCESSENTRY32W pe{};
     pe.dwSize = sizeof(pe);
     bool found = false;
-    if (Process32FirstW(snap, &pe)) {
+    if (g_api.procFirst(snap, &pe)) {
         do {
-            if (_wcsicmp(pe.szExeFile, L"StardewModdingAPI.exe") == 0 ||
-                _wcsicmp(pe.szExeFile, L"Stardew Valley.exe") == 0) { found = true; break; }
-        } while (Process32NextW(snap, &pe));
+            if (_wcsicmp(pe.szExeFile, SW(L"StardewModdingAPI.exe").c_str()) == 0 ||
+                _wcsicmp(pe.szExeFile, SW(L"Stardew Valley.exe").c_str()) == 0) { found = true; break; }
+        } while (g_api.procNext(snap, &pe));
     }
     CloseHandle(snap);
     return found;
@@ -275,14 +377,14 @@ bool isGameRunning() {
 // UI
 // ----------------------------------------------------------------------------
 enum class Action { Launch, Coop, Fix, About, Exit };
-struct MenuItem { const char* label; Action action; const char* desc; };
+struct MenuItem { std::string label; Action action; std::string desc; };
 
-const MenuItem MENU[] = {
-    {"Launch Game", Action::Launch, "start Stardew Valley via SMAPI (silent)"},
-    {"Join Co-op",  Action::Coop,   "coming soon"},
-    {"Apply Fix",   Action::Fix,    "coming soon"},
-    {"About",       Action::About,  "what is this"},
-    {"Exit",        Action::Exit,   "close the launcher"},
+static const MenuItem MENU[] = {
+    {S("Launch Game"), Action::Launch, S("start Stardew Valley via SMAPI (silent)")},
+    {S("Join Co-op"),  Action::Coop,   S("coming soon")},
+    {S("Apply Fix"),   Action::Fix,    S("coming soon")},
+    {S("About"),       Action::About,  S("what is this")},
+    {S("Exit"),        Action::Exit,   S("close the launcher")},
 };
 
 void statusLine(const std::string& msg, const std::string& color) {
@@ -291,15 +393,15 @@ void statusLine(const std::string& msg, const std::string& color) {
 
 void aboutScreen() {
     std::cout << term::CLEAR << term::HOME;
-    std::cout << pal::gold << term::BOLD << "  ABOUT\n" << term::RESET;
-    std::cout << pal::cream << "  game.exe v0.1.0\n\n" << term::RESET;
-    std::cout << pal::cream << "  A private launcher for a fully-modded Stardew Valley\n";
-    std::cout << "  co-op setup (SMAPI + mods + Goldberg emulator).\n\n" << term::RESET;
-    std::cout << pal::dim << "  Game dir:    ";
+    std::cout << pal::gold << term::BOLD << S("  ABOUT\n") << term::RESET;
+    std::cout << pal::cream << S("  game.exe v0.2.0\n\n") << term::RESET;
+    std::cout << pal::cream << S("  A private launcher for a fully-modded Stardew Valley\n");
+    std::cout << S("  co-op setup (SMAPI + mods + Goldberg emulator).\n\n") << term::RESET;
+    std::cout << pal::dim << S("  Game dir:    ");
     auto d = findGameDir();
-    std::cout << (d ? "found" : "not found") << "\n" << term::RESET;
-    std::cout << pal::dim << "  Game running: " << (isGameRunning() ? "yes" : "no") << "\n\n" << term::RESET;
-    std::cout << pal::cyan << "  Press Enter to go back" << term::RESET << std::endl;
+    std::cout << (d ? S("found") : S("not found")) << "\n" << term::RESET;
+    std::cout << pal::dim << S("  Game running: ") << (isGameRunning() ? S("yes") : S("no")) << "\n\n" << term::RESET;
+    std::cout << pal::cyan << S("  Press Enter to go back") << term::RESET << std::endl;
     for (;;) {
         int k = _getch();
         if (k == '\r' || k == 27) break;
@@ -311,28 +413,28 @@ void doAction(Action a, Console& console) {
         case Action::Launch: {
             auto dir = findGameDir();
             if (!dir) {
-                statusLine("! game folder not found.", pal::red);
+                statusLine(S("! game folder not found."), pal::red);
                 std::this_thread::sleep_for(std::chrono::milliseconds(1600));
                 return;
             }
             if (isGameRunning()) {
-                statusLine("! the game is already running.", pal::amber);
+                statusLine(S("! the game is already running."), pal::amber);
                 std::this_thread::sleep_for(std::chrono::milliseconds(1400));
                 return;
             }
-            spinner(3, "launching game silently");
+            spinner(3, S("launching game silently"));
             std::wstring err;
             if (launchGameSilently(*dir, err)) {
-                statusLine("  game launched (SMAPI console hidden)", pal::ok);
+                statusLine(S("  game launched (SMAPI console hidden)"), pal::ok);
             } else {
-                statusLine("! " + toUtf8(err), pal::red);
+                statusLine(S("! ") + toUtf8(err), pal::red);
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1400));
             break;
         }
         case Action::Coop:
         case Action::Fix:
-            statusLine("! coming soon — will be wired in a later update.", pal::amber);
+            statusLine(S("! coming soon — will be wired in a later update."), pal::amber);
             std::this_thread::sleep_for(std::chrono::milliseconds(1500));
             break;
         case Action::About:
@@ -353,16 +455,16 @@ void render(const Console& console, int sel) {
         bool on = (static_cast<int>(i) == sel);
         std::cout << "    ";
         if (on) {
-            std::cout << pal::green << term::BOLD << "▶ " << term::RESET
+            std::cout << pal::green << term::BOLD << S("▶ ") << term::RESET
                       << pal::bg(38, 62, 28) << pal::green << " " << MENU[i].label
-                      << "  " << term::RESET << pal::dim << " " << MENU[i].desc << term::RESET;
+                      << S("  ") << term::RESET << pal::dim << " " << MENU[i].desc << term::RESET;
         } else {
-            std::cout << "  " << pal::dim << MENU[i].label << term::RESET;
+            std::cout << S("  ") << pal::dim << MENU[i].label << term::RESET;
         }
         std::cout << "\n";
     }
     std::cout << "\n  " << pal::dim
-              << "up/down navigate  ·  enter select  ·  esc quit"
+              << S("up/down navigate  ·  enter select  ·  esc quit")
               << term::RESET << "\n";
     std::cout << std::flush;
 }
@@ -373,18 +475,19 @@ void render(const Console& console, int sel) {
 int main(int argc, char** argv) {
     Console console;
     console.init();
+    initApi();
 
-    const bool selftest = (argc > 1 && std::string(argv[1]) == "--selftest");
+    const bool selftest = (argc > 1 && std::string(argv[1]) == S("--selftest"));
 
     // startup animation
     std::cout << term::CLEAR << term::HOME;
-    std::cout << pal::green << term::BOLD << "\n  game.exe" << term::RESET << "\n\n";
-    spinner(5, "initializing");
-    typewriter(pal::gold + "  Stardew Valley Online\n" + term::RESET, 8);
+    std::cout << pal::green << term::BOLD << S("\n  game.exe") << term::RESET << "\n\n";
+    spinner(5, S("initializing"));
+    typewriter(pal::gold + S("  Stardew Valley Online\n") + term::RESET, 8);
 
     int sel = 0;
     int key = 0;
-    console.title("Multiplayer Private — Stardew Valley Online");
+    console.title(S("Multiplayer Private — Stardew Valley Online"));
     render(console, sel);
 
     while (!console.stop) {
