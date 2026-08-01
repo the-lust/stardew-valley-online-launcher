@@ -1,0 +1,9 @@
+# build artifacts
+*.exe
+*.obj
+*.res
+*.pdb
+*.ilk
+
+# local secrets (never commit)
+.vtkey
