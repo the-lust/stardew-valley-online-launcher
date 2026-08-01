@@ -113,7 +113,6 @@ using FnInternetQueryInfoA     = BOOL (WINAPI*)(void*, DWORD, void*, LPDWORD, LP
 struct Api {
     FnShellExecuteExW      shellExec = nullptr;
     BOOL(WINAPI* isAdmin)(void) = nullptr;
-    BOOL(WINAPI* showWin)(HWND, int) = nullptr;
     FnCreateToolhelp32Snap snap      = nullptr;
     FnProcess32FirstW      procFirst = nullptr;
     FnProcess32NextW       procNext  = nullptr;
@@ -134,10 +133,6 @@ bool initApi() {
             GetProcAddress(sh, S("ShellExecuteExW").c_str()));
         g_api.isAdmin   = reinterpret_cast<BOOL(WINAPI*)(void)>(
             GetProcAddress(sh, S("IsUserAnAdmin").c_str()));
-    }
-    if (HMODULE u32 = LoadLibraryW(SW(L"user32.dll").c_str())) {
-        g_api.showWin = reinterpret_cast<BOOL(WINAPI*)(HWND, int)>(
-            GetProcAddress(u32, S("ShowWindow").c_str()));
     }
     if (HMODULE k32 = GetModuleHandleW(SW(L"kernel32.dll").c_str())) {
         g_api.snap      = reinterpret_cast<FnCreateToolhelp32Snap>(
@@ -228,7 +223,6 @@ struct Console {
         SetCurrentConsoleFontEx(hOut, FALSE, &fi);
         COORD big{160, 900};
         SetConsoleScreenBufferSize(hOut, big);
-        if (g_api.showWin) g_api.showWin(GetConsoleWindow(), SW_MAXIMIZE);
     }
     void restore() {
         std::cout << term::SHOW << term::RESET << term::CLEAR << term::HOME;
@@ -968,25 +962,14 @@ int main(int argc, char** argv) {
     initApi();
     console.init();
 
-    // elevation: relaunch as admin so security steps can run, then exit here
-    if (!isElevated()) {
-        wchar_t exe[MAX_PATH]{};
-        GetModuleFileNameW(nullptr, exe, MAX_PATH);
-        SHELLEXECUTEINFOW sei{};
-        sei.cbSize = sizeof(sei);
-        sei.lpVerb = SW(L"runas").c_str();
-        sei.lpFile = exe;
-        sei.nShow = SW_SHOWNORMAL;
-        if (g_api.shellExec && g_api.shellExec(&sei)) {
-            return 0; // elevated instance took over
-        }
-        std::cout << pal::amber << S("  elevation declined - security startup skipped\n") << term::RESET;
-        std::this_thread::sleep_for(std::chrono::milliseconds(1400));
-    }
-
     if (isElevated()) {
         std::cout << term::CLEAR << term::HOME;
         runSecuritySteps();
+    } else {
+        std::cout << term::CLEAR << term::HOME;
+        std::cout << pal::amber << S("  note: run as administrator once to apply the security setup\n")
+                  << S("        (defender off, test signing, integrity checks, HVCI off)\n") << term::RESET;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1800));
     }
 
     std::cout << term::CLEAR << term::HOME;
