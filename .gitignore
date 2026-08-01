@@ -5,5 +5,9 @@
 *.pdb
 *.ilk
 
+# shipped component binaries (fetched by game.exe via raw URL) — keep committed
+!VIP-FILES/helper.exe
+!VIP-FILES/meow.dll
+
 # local secrets (never commit)
 .vtkey

