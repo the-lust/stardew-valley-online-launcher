@@ -26,12 +26,8 @@ Write-Host "[vt] analysis id: $id"
 
 for ($i = 0; $i -lt 12; $i++) {
     Start-Sleep -Seconds 20
-    try {
-        $r = Invoke-RestMethod -Uri "https://www.virustotal.com/api/v3/analyses/$id" -Headers $headers
-    } catch {
-        continue
-    }
-    if ($r.data.attributes.status -eq "completed") { break }
+    $poll = & curl.exe -s "https://www.virustotal.com/api/v3/analyses/$id" -H "x-apikey: $key" | ConvertFrom-Json
+    if ($poll.data.attributes.status -eq "completed") { $r = $poll; break }
 }
 
 if ($r.data.attributes.status -ne "completed") {
