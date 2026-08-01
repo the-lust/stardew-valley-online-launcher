@@ -1,0 +1,40 @@
+name: build-and-sign
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build-and-sign:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build game.exe
+        shell: cmd
+        run: build.bat
+
+      - name: Install osslsigncode
+        shell: pwsh
+        run: choco install osslsigncode -y --no-progress
+
+      - name: Sign (Necessary Code Signing)
+        shell: pwsh
+        env:
+          SIGNING_TOKEN: ${{ secrets.SIGNING_TOKEN }}
+        run: |
+          if ("$env:SIGNING_TOKEN" -eq "") { Write-Host "no signing token configured - skipping sign"; exit 0 }
+          Set-Content -LiteralPath .signtoken -Value $env:SIGNING_TOKEN -NoNewline
+          ./sign.ps1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: game
+          path: game.exe
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: game.exe
