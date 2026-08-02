@@ -35,7 +35,7 @@ if errorlevel 1 (
     echo [FAIL] helper compilation failed.
     exit /b 1
 )
-cl /nologo /LD /EHsc /O2 /utf-8 /W4 /wd4996 meow.cpp advapi32.lib /Fe:meow.dll
+cl /nologo /LD /EHsc /std:c++20 /O2 /utf-8 /W4 /wd4996 meow.cpp advapi32.lib /Fe:meow.dll
 if errorlevel 1 (
     echo.
     echo [FAIL] meow.dll compilation failed.
