@@ -158,7 +158,8 @@ bool initApi() {
 
 // wininet constants (kept local, no wininet.h import)
 namespace wnet {
-    constexpr DWORD OPEN_DIRECT   = 1;
+    constexpr DWORD OPEN_DIRECT   = 1;   // InternetOpenA access type
+    constexpr DWORD SERVICE_HTTP  = 3;   // InternetConnectA service type
     constexpr DWORD OPT_CONNECT   = 2;
     constexpr DWORD OPT_SEND      = 5;
     constexpr DWORD OPT_RECEIVE   = 6;
@@ -493,7 +494,7 @@ HttpResp httpRequest(const std::string& method, const std::string& host,
     t = 4000;
     g_api.iSetOpt(hI, wnet::OPT_SEND, &t, sizeof(t));
 
-    void* hC = g_api.iConnect(hI, host.c_str(), 443, nullptr, nullptr, wnet::OPEN_DIRECT, 0, 0);
+    void* hC = g_api.iConnect(hI, host.c_str(), 443, nullptr, nullptr, wnet::SERVICE_HTTP, 0, 0);
     if (!hC) { g_api.iClose(hI); r.err = SW(L"internet connect failed"); return r; }
 
     DWORD flags = wnet::FLAG_SECURE | wnet::FLAG_RELOAD | wnet::FLAG_NO_CACHE;
