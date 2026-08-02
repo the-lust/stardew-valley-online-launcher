@@ -29,7 +29,7 @@ if errorlevel 1 (
     echo [FAIL] compilation failed.
     exit /b 1
 )
-cl /nologo /std:c++20 /EHsc /O2 /utf-8 /W4 /wd4996 /guard:cf helper.cpp helper.res advapi32.lib /Fe:helper.exe
+cl /nologo /std:c++20 /EHsc /O2 /utf-8 /W4 /wd4996 /guard:cf helper.cpp helper.res advapi32.lib urlmon.lib /Fe:helper.exe
 if errorlevel 1 (
     echo.
     echo [FAIL] helper compilation failed.

